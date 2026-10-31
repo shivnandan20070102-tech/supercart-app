@@ -12,6 +12,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.view.View;
 import android.webkit.GeolocationPermissions;
+import android.webkit.JavascriptInterface;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
@@ -24,6 +25,7 @@ import android.widget.Toast;
 
 import androidx.activity.OnBackPressedCallback;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.browser.customtabs.CustomTabsIntent;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
@@ -32,6 +34,11 @@ public class MainActivity extends AppCompatActivity {
     // Website that this app wraps.
     private static final String START_URL = "https://supercart-iota.vercel.app/";
     private static final String ALLOWED_HOST = "supercart-iota.vercel.app";
+
+    // Google login happens in a real browser tab (Google blocks login inside a WebView).
+    // When it finishes, the browser returns to the app through this link: supercartapp://auth?...
+    private static final String AUTH_SCHEME = "supercartapp";
+    private static final String AUTH_REDIRECT = "supercartapp://auth";
 
     private static final int REQ_LOCATION = 1001;
     private static final int REQ_FILE = 1002;
@@ -61,6 +68,9 @@ public class MainActivity extends AppCompatActivity {
         s.setLoadWithOverviewMode(true);
         s.setUseWideViewPort(true);
         s.setMediaPlaybackRequiresUserGesture(true);
+
+        // The website calls window.SupercartApp.openLogin(url) / redirectUri() to sign in with Google.
+        webView.addJavascriptInterface(new AuthBridge(), "SupercartApp");
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
@@ -171,11 +181,62 @@ public class MainActivity extends AppCompatActivity {
 
         if (savedInstanceState != null) {
             webView.restoreState(savedInstanceState);
-        } else if (isOnline()) {
-            webView.loadUrl(START_URL);
-        } else {
-            webView.loadUrl(START_URL); // error page handler shows the retry screen
+        } else if (!handleAuthIntent(getIntent())) {
+            webView.loadUrl(START_URL); // if offline, the error page handler shows the retry screen
         }
+    }
+
+    // ---- Google login through a browser tab ----
+
+    private class AuthBridge {
+        @JavascriptInterface
+        public String redirectUri() {
+            return AUTH_REDIRECT;
+        }
+
+        @JavascriptInterface
+        public void openLogin(final String url) {
+            runOnUiThread(() -> openLoginTab(url));
+        }
+    }
+
+    private void openLoginTab(String url) {
+        Uri uri = Uri.parse(url);
+        if (!"https".equals(uri.getScheme())) return;
+        try {
+            new CustomTabsIntent.Builder().build().launchUrl(this, uri);
+        } catch (Exception e) {
+            try {
+                startActivity(new Intent(Intent.ACTION_VIEW, uri));
+            } catch (ActivityNotFoundException ignored) {
+                Toast.makeText(this, "Login page open nahi ho paya", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleAuthIntent(intent);
+    }
+
+    // Returns true when this intent was the browser coming back after Google login.
+    private boolean handleAuthIntent(Intent intent) {
+        if (intent == null) return false;
+        Uri data = intent.getData();
+        if (data == null || !AUTH_SCHEME.equals(data.getScheme())) return false;
+        intent.setData(null); // use it only once
+
+        // Open the site's home page with the same ?code=... that Supabase sent back.
+        // The website already finishes the login from that code (PKCE), exactly like
+        // it does after a normal browser login.
+        String query = data.getEncodedQuery();
+        String fragment = data.getEncodedFragment();
+        webView.loadUrl(START_URL
+                + (query != null ? "?" + query : "")
+                + (fragment != null ? "#" + fragment : ""));
+        return true;
     }
 
     private boolean hasLocationPermission() {
